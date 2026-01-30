@@ -2,49 +2,56 @@ from AlgorithmImports import *
 from QuantConnect.Indicators import *
 from datetime import timedelta
 
-class AggressiveCryptoMomentum(QCAlgorithm):
+class ExtendedMultiAssetCryptoMomentum(QCAlgorithm):
     
     def Initialize(self):
-        self.SetStartDate(2020, 1, 1)  # Backtest period
-        self.SetEndDate(datetime.now())
+        self.SetStartDate(2017, 1, 1)  # Extended backtest start
+        self.SetEndDate(datetime.now())  # To current date
         self.SetCash(100000)  # Starting capital
         
-        # Universe: Single crypto pair (BTC/USD) - Hourly for more trades
-        self.btc = self.AddCrypto("BTCUSD", Resolution.Hour).Symbol
+        # Universe: Multiple crypto pairs for diversification
+        self.symbols = [self.AddCrypto(pair, Resolution.Hour).Symbol for pair in ["BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD"]]
         self.UniverseSettings.Resolution = Resolution.Hour
-        self.SetUniverseSelection(ManualUniverseSelectionModel([self.btc]))
+        self.SetUniverseSelection(ManualUniverseSelectionModel(self.symbols))
         
-        # Indicators
-        self.dc = DonchianChannel(5)  # Short for frequent breakouts
-        self.RegisterIndicator(self.btc, self.dc, Resolution.Hour)
+        # Per-symbol indicators
+        self.dc = {sym: DonchianChannel(5) for sym in self.symbols}
+        self.atr = {sym: self.ATR(sym, 14, MovingAverageType.Simple, Resolution.Hour) for sym in self.symbols}
+        for sym in self.symbols:
+            self.RegisterIndicator(sym, self.dc[sym], Resolution.Hour)
         
-        # Set leverage
-        self.Securities[self.btc].SetLeverage(5)
+        # Set leverage for all
+        for sym in self.symbols:
+            self.Securities[sym].SetLeverage(5)
         
         # Framework models
         self.SetAlpha(CustomAlphaModel(self))
-        self.SetPortfolioConstruction(EqualWeightingPortfolioConstructionModel())
+        self.SetPortfolioConstruction(InsightWeightingPortfolioConstructionModel())  # Weights by insight
         self.SetExecution(ImmediateExecutionModel())
         self.SetRiskManagement(TrailingStopRiskManagementModel(0.02))  # 2% trailing stop
         
         # Warm-up
-        self.SetWarmUp(timedelta(days=1))  # Shorter for hourly
-        
-        # Force a test trade to confirm orders work
-        self.Debug("Forcing a test buy order on initialization.")
-        self.SetHoldings(self.btc, 0.01)  # Small 1% portfolio buy to test
+        self.SetWarmUp(timedelta(days=1))
+
+    def OnWarmUpFinished(self):
+        # Force test trade after warm-up to ensure data readiness
+        btc = self.symbols[0]  # BTCUSD
+        if self.Securities[btc].Price > 0:
+            self.Debug("Forcing a test buy order after warm-up.")
+            self.SetHoldings(btc, 0.01)  # Small 1% on BTC
 
     def OnData(self, data):
         if self.IsWarmingUp: return
-        bar = data.Bars.get(self.btc)
-        if bar is None: return
-        
-        if bar.Close >= self.dc.UpperBand.Current.Value:
-            self.Debug("Manual long order test triggered!")
-            self.SetHoldings(self.btc, 0.1)  # Buy 10% portfolio
-        elif bar.Close <= self.dc.LowerBand.Current.Value:
-            self.Debug("Manual short order test triggered!")
-            self.SetHoldings(self.btc, -0.1)  # Short 10% portfolio
+        for sym in self.symbols:
+            bar = data.Bars.get(sym)
+            if bar is None: continue
+            
+            if bar.Close >= self.dc[sym].UpperBand.Current.Value:
+                self.Debug(f"Manual long order test triggered for {sym.Value}!")
+                self.SetHoldings(sym, 0.1)
+            elif bar.Close <= self.dc[sym].LowerBand.Current.Value:
+                self.Debug(f"Manual short order test triggered for {sym.Value}!")
+                self.SetHoldings(sym, -0.1)
 
 class CustomAlphaModel(AlphaModel):
     def __init__(self, algorithm):
@@ -53,25 +60,35 @@ class CustomAlphaModel(AlphaModel):
     def Update(self, algorithm, data):
         insights = []
         
-        if not self.algorithm.dc.IsReady:
-            self.algorithm.Debug("Indicators not ready yet.")
-            return insights
-        
-        bar = data.Bars.get(self.algorithm.btc)
-        if bar is None:
-            self.algorithm.Debug("No bar data available.")
-            return insights
-        
-        # Log values (reduced to daily summaries to avoid rate limiting)
-        if algorithm.Time.hour == 0:
-            self.algorithm.Debug(f"Date: {algorithm.Time} | Close: {bar.Close} | DC Upper: {self.algorithm.dc.UpperBand.Current.Value} | DC Lower: {self.algorithm.dc.LowerBand.Current.Value} | Volume: {bar.Volume}")
-        
-        # Temporary: No filters to force trades
-        if bar.Close >= self.algorithm.dc.UpperBand.Current.Value:
-            self.algorithm.Debug("Long signal triggered! (No filters)")
-            insights.append(Insight.Price(self.algorithm.btc, timedelta(hours=24), InsightDirection.Up, 0.10))
-        elif bar.Close <= self.algorithm.dc.LowerBand.Current.Value:
-            self.algorithm.Debug("Short signal triggered! (No filters)")
-            insights.append(Insight.Price(self.algorithm.btc, timedelta(hours=24), InsightDirection.Down, 0.10))
+        for sym in self.algorithm.symbols:  # Loop over stored list
+            if not (self.algorithm.dc[sym].IsReady and self.algorithm.atr[sym].IsReady):
+                algorithm.Debug(f"Indicators not ready for {sym.Value}.")
+                continue
+            
+            bar = data.Bars.get(sym)
+            if bar is None or bar.Close == 0:  # Skip if no data (e.g., sparse pre-2018)
+                algorithm.Debug(f"No valid bar data for {sym.Value}.")
+                continue
+            
+            # Daily summary log per asset (reduced frequency)
+            if algorithm.Time.hour == 0:
+                algorithm.Debug(f"Date: {algorithm.Time} | Asset: {sym.Value} | Close: {bar.Close} | DC Upper: {self.algorithm.dc[sym].UpperBand.Current.Value} | DC Lower: {self.algorithm.dc[sym].LowerBand.Current.Value} | Volume: {bar.Volume} | ATR: {self.algorithm.atr[sym].Current.Value}")
+            
+            # Adaptive weight (2% risk per trade)
+            if self.algorithm.atr[sym].Current.Value > 0:
+                risk_per_trade = algorithm.Portfolio.TotalPortfolioValue * 0.02
+                stop_distance = self.algorithm.atr[sym].Current.Value * 1.5
+                weight = risk_per_trade / (bar.Close * stop_distance)
+                weight = min(weight, 0.2)
+            else:
+                weight = 0.2
+            
+            # No-filter breakout signals
+            if bar.Close >= self.algorithm.dc[sym].UpperBand.Current.Value:
+                algorithm.Debug(f"Long signal triggered for {sym.Value}! (No filters)")
+                insights.append(Insight.Price(sym, timedelta(hours=48), InsightDirection.Up, 0.10, weight=weight))
+            elif bar.Close <= self.algorithm.dc[sym].LowerBand.Current.Value:
+                algorithm.Debug(f"Short signal triggered for {sym.Value}! (No filters)")
+                insights.append(Insight.Price(sym, timedelta(hours=48), InsightDirection.Down, 0.10, weight=weight))
         
         return insights
